@@ -1,0 +1,515 @@
+"""
+RL Pipeline Report
+Based on: "Hybrid neural-cognitive models reveal how memory shapes human reward learning"
+(Eckstein, Summerfield, Daw & Miller, 2025, Nature Human Behaviour)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+np.random.seed(42)
+torch.manual_seed(42)
+
+DATA_PATH = "openSourceRawDataset.csv"
+
+
+# =============================================================================
+# SECTION 1: Data Exploration & Figure 1e Replica
+# =============================================================================
+
+def section_1():
+    print("=" * 70)
+    print("SECTION 1: Data Exploration & Figure 1e Replica")
+    print("=" * 70)
+
+    df = pd.read_csv(DATA_PATH)
+
+    # Pick 3 participants who have a block with 150 trials
+    participant_blocks = (
+        df.groupby(["s_id", "block"])
+        .size()
+        .reset_index(name="n_trials")
+    )
+    long_blocks = participant_blocks[participant_blocks["n_trials"] == 150]
+    example_ids = long_blocks["s_id"].unique()[:3]
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 10))
+    colors = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3"]
+    action_labels = ["D (top-L)", "J (top-R)", "F (bot-L)", "K (bot-R)"]
+
+    for row, sid in enumerate(example_ids):
+        sub = df[df["s_id"] == sid]
+        # Pick the first block with 150 trials
+        block_counts = sub.groupby("block").size()
+        block_id = block_counts[block_counts == 150].index[0]
+        block_data = sub[sub["block"] == block_id].sort_values("trial_id")
+
+        trials = block_data["trial_id"].values
+
+        # Left panel: reward schedules
+        ax_left = axes[row, 0]
+        for i, col in enumerate(["payout_1", "payout_2", "payout_3", "payout_4"]):
+            ax_left.plot(trials, block_data[col].values * 100, color=colors[i],
+                         alpha=0.7, linewidth=1.2, label=action_labels[i])
+        ax_left.set_ylabel("Reward (points)")
+        ax_left.set_ylim(0, 100)
+        if row == 0:
+            ax_left.set_title("Reward Schedules")
+            ax_left.legend(fontsize=7, loc="upper right")
+        if row == 2:
+            ax_left.set_xlabel("Trial")
+        ax_left.text(-0.12, 0.5, f"P{sid}", transform=ax_left.transAxes,
+                     fontsize=11, fontweight="bold", va="center", rotation=90)
+
+        # Right panel: participant choices
+        ax_right = axes[row, 1]
+        actions = block_data["action"].values.astype(int)
+        for t, a in enumerate(actions):
+            ax_right.scatter(t, a, color=colors[a], s=12, alpha=0.7, zorder=2)
+        ax_right.set_yticks([0, 1, 2, 3])
+        ax_right.set_yticklabels(action_labels)
+        ax_right.set_ylim(-0.5, 3.5)
+        if row == 0:
+            ax_right.set_title("Participant Choices")
+        if row == 2:
+            ax_right.set_xlabel("Trial")
+
+    plt.tight_layout()
+    plt.savefig("plot_1_data_exploration.png", dpi=150)
+    plt.close()
+    print("Saved: plot_1_data_exploration.png")
+
+
+# =============================================================================
+# SECTION 2: Q-Learning Model & Reward Box Plot
+# =============================================================================
+
+def softmax(x):
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / e.sum()
+
+
+def run_q_learning_on_schedule(payouts, alpha, kappa, beta, q_init=0.8):
+    """
+    Run simplified Q-learning model on a reward schedule.
+    payouts: array of shape (T, 4) — available rewards for each action on each trial
+    Returns: total reward collected
+    """
+    T = payouts.shape[0]
+    Q = np.full(4, q_init)
+    c = np.zeros(4)
+    total_reward = 0.0
+
+    for t in range(T):
+        # Compute choice probabilities
+        h = Q + c
+        p = softmax(beta * h)
+
+        # Sample action
+        action = np.random.choice(4, p=p)
+
+        # Get reward from the schedule
+        reward = payouts[t, action]
+        total_reward += reward
+
+        # Update Q-value for chosen action (eq 1)
+        Q[action] = Q[action] + alpha * (reward - Q[action])
+
+        # Update perseveration (eq 4)
+        c = np.zeros(4)
+        c[action] = kappa
+
+    return total_reward
+
+
+def section_2():
+    print("=" * 70)
+    print("SECTION 2: Q-Learning Model & Reward Box Plot")
+    print("=" * 70)
+
+    df = pd.read_csv(DATA_PATH)
+
+    # Get 10 different reward schedules (150-trial blocks)
+    participant_blocks = (
+        df.groupby(["s_id", "block"])
+        .size()
+        .reset_index(name="n_trials")
+    )
+    long_blocks = participant_blocks[participant_blocks["n_trials"] == 150]
+    selected = long_blocks.sample(n=10, random_state=42)
+
+    schedules = []
+    for _, row in selected.iterrows():
+        block_data = df[(df["s_id"] == row["s_id"]) & (df["block"] == row["block"])]
+        block_data = block_data.sort_values("trial_id")
+        payouts = block_data[["payout_1", "payout_2", "payout_3", "payout_4"]].values
+        schedules.append(payouts)
+
+    # Define parameter settings (good and bad)
+    param_settings = [
+        {"alpha": 0.5,  "kappa": 0.1,  "beta": 6.0,  "label": "Good\na=0.5 k=0.1 b=6"},
+        {"alpha": 0.3,  "kappa": 0.05, "beta": 8.0,  "label": "Good\na=0.3 k=0.05 b=8"},
+        {"alpha": 0.2,  "kappa": 0.2,  "beta": 4.0,  "label": "Medium\na=0.2 k=0.2 b=4"},
+        {"alpha": 0.05, "kappa": 0.0,  "beta": 2.0,  "label": "Medium\na=0.05 k=0 b=2"},
+        {"alpha": 0.01, "kappa": 0.0,  "beta": 0.5,  "label": "Bad\na=0.01 k=0 b=0.5"},
+        {"alpha": 0.5,  "kappa": 0.9,  "beta": 1.0,  "label": "Bad\na=0.5 k=0.9 b=1"},
+    ]
+
+    # Run simulations
+    n_runs = 5
+    all_rewards = {s["label"]: [] for s in param_settings}
+
+    for params in param_settings:
+        for schedule in schedules:
+            for _ in range(n_runs):
+                total = run_q_learning_on_schedule(
+                    schedule, params["alpha"], params["kappa"], params["beta"]
+                )
+                all_rewards[params["label"]].append(total * 100)  # Scale to points
+
+    # Compute chance-level reward (random policy)
+    chance_rewards = []
+    for schedule in schedules:
+        for _ in range(n_runs):
+            total = sum(schedule[t, np.random.choice(4)] for t in range(150))
+            chance_rewards.append(total * 100)
+    chance_mean = np.mean(chance_rewards)
+
+    # Box plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    labels = list(all_rewards.keys())
+    data = [all_rewards[l] for l in labels]
+    bp = ax.boxplot(data, labels=labels, patch_artist=True)
+
+    box_colors = ["#2ca02c", "#2ca02c", "#ff7f0e", "#ff7f0e", "#d62728", "#d62728"]
+    for patch, color in zip(bp["boxes"], box_colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+
+    ax.axhline(chance_mean, color="gray", linestyle="--", alpha=0.7, label="Chance level")
+    ax.set_ylabel("Total Reward (points over 150 trials)")
+    ax.set_title("Q-Learning Model Performance Across Parameter Settings")
+    ax.legend()
+    plt.xticks(fontsize=8)
+    plt.tight_layout()
+    plt.savefig("plot_2_model_rewards.png", dpi=150)
+    plt.close()
+    print("Saved: plot_2_model_rewards.png")
+
+
+# =============================================================================
+# SECTION 3: Maximum-Likelihood Fitting with PyTorch
+# =============================================================================
+
+class QLearningModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.alpha_raw = nn.Parameter(torch.tensor(0.0))
+        self.kappa_raw = nn.Parameter(torch.tensor(0.0))
+        self.beta_raw = nn.Parameter(torch.tensor(1.0))
+
+    @property
+    def alpha(self):
+        return torch.sigmoid(self.alpha_raw)
+
+    @property
+    def kappa(self):
+        return torch.tanh(self.kappa_raw)
+
+    @property
+    def beta(self):
+        return F.softplus(self.beta_raw)
+
+    def forward(self, actions, rewards):
+        T = len(actions)
+        Q = torch.full((4,), 0.8)
+        c = torch.zeros(4)
+        nll = torch.tensor(0.0)
+
+        for t in range(T):
+            h = Q + c
+            log_probs = F.log_softmax(self.beta * h, dim=0)
+            nll = nll - log_probs[actions[t]]
+
+            # Update Q for chosen action
+            Q = Q.clone()
+            delta = self.alpha * (rewards[t] - Q[actions[t]])
+            Q[actions[t]] = Q[actions[t]] + delta
+
+            # Update perseveration
+            c = torch.zeros(4)
+            c[actions[t]] = self.kappa
+
+        return nll
+
+
+def fit_participant_ql(actions, rewards, n_steps=500, lr=0.01):
+    """Fit Q-learning model to one participant's data. Returns loss history and fitted params."""
+    model = QLearningModel()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    actions_t = torch.tensor(actions, dtype=torch.long)
+    rewards_t = torch.tensor(rewards, dtype=torch.float32)
+
+    loss_history = []
+    for step in range(n_steps):
+        optimizer.zero_grad()
+        loss = model(actions_t, rewards_t)
+        loss.backward()
+        optimizer.step()
+        loss_history.append(loss.item())
+
+    params = {
+        "alpha": model.alpha.item(),
+        "kappa": model.kappa.item(),
+        "beta": model.beta.item(),
+    }
+    return loss_history, params
+
+
+def section_3():
+    print("=" * 70)
+    print("SECTION 3: Maximum-Likelihood Fitting with PyTorch")
+    print("=" * 70)
+
+    df = pd.read_csv(DATA_PATH)
+
+    # Get participants with 150-trial blocks
+    participant_blocks = (
+        df.groupby(["s_id", "block"])
+        .size()
+        .reset_index(name="n_trials")
+    )
+    long_blocks = participant_blocks[participant_blocks["n_trials"] == 150]
+    unique_pids = long_blocks["s_id"].unique()
+    selected_pids = unique_pids[:20]
+
+    all_params = []
+    all_losses = {}
+
+    for i, pid in enumerate(selected_pids):
+        sub = df[df["s_id"] == pid]
+        block_counts = sub.groupby("block").size()
+        block_id = block_counts[block_counts == 150].index[0]
+        block_data = sub[sub["block"] == block_id].sort_values("trial_id")
+
+        actions = block_data["action"].values.astype(int)
+        rewards = block_data["reward"].values.astype(float)
+
+        loss_hist, params = fit_participant_ql(actions, rewards)
+        params["s_id"] = pid
+        all_params.append(params)
+        all_losses[pid] = loss_hist
+
+        if (i + 1) % 5 == 0:
+            print(f"  Fitted {i + 1}/{len(selected_pids)} participants...")
+
+    params_df = pd.DataFrame(all_params)
+
+    # Plot 3a: Loss curves for 5 example participants
+    fig, ax = plt.subplots(figsize=(10, 5))
+    example_pids = selected_pids[:5]
+    for pid in example_pids:
+        ax.plot(all_losses[pid], label=f"P{pid}", alpha=0.8)
+    ax.set_xlabel("Optimization Step")
+    ax.set_ylabel("Negative Log-Likelihood")
+    ax.set_title("Loss Curves: Fitting Q-Learning to Individual Participants")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("plot_3a_loss_curves.png", dpi=150)
+    plt.close()
+    print("Saved: plot_3a_loss_curves.png")
+
+    # Plot 3b: Parameter scatter plots
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+
+    axes[0].scatter(params_df["alpha"], params_df["kappa"], c="#377eb8", alpha=0.7, s=40)
+    axes[0].set_xlabel("Learning Rate (alpha)")
+    axes[0].set_ylabel("Perseveration (kappa)")
+    axes[0].set_title("Alpha vs Kappa")
+
+    axes[1].scatter(params_df["alpha"], params_df["beta"], c="#e41a1c", alpha=0.7, s=40)
+    axes[1].set_xlabel("Learning Rate (alpha)")
+    axes[1].set_ylabel("Inverse Temperature (beta)")
+    axes[1].set_title("Alpha vs Beta")
+
+    axes[2].scatter(params_df["kappa"], params_df["beta"], c="#4daf4a", alpha=0.7, s=40)
+    axes[2].set_xlabel("Perseveration (kappa)")
+    axes[2].set_ylabel("Inverse Temperature (beta)")
+    axes[2].set_title("Kappa vs Beta")
+
+    plt.tight_layout()
+    plt.savefig("plot_3b_parameter_scatter.png", dpi=150)
+    plt.close()
+    print("Saved: plot_3b_parameter_scatter.png")
+
+    return params_df, all_losses, selected_pids
+
+
+# =============================================================================
+# SECTION 4: RL-ANN (Neural Network Q-Learning) & Comparison
+# =============================================================================
+
+class RLANN(nn.Module):
+    def __init__(self, hidden_size=32):
+        super().__init__()
+        # Reward MLP: [Q(a), r] -> Q_new(a)
+        self.reward_w1 = nn.Parameter(torch.randn(hidden_size, 2) * 0.1)
+        self.reward_b1 = nn.Parameter(torch.zeros(hidden_size))
+        self.reward_w2 = nn.Parameter(torch.randn(1, hidden_size) * 0.1)
+        self.reward_b2 = nn.Parameter(torch.zeros(1))
+
+        # Action-history MLP: one-hot(a) -> c (size 4)
+        self.action_w1 = nn.Parameter(torch.randn(hidden_size, 4) * 0.1)
+        self.action_b1 = nn.Parameter(torch.zeros(hidden_size))
+        self.action_w2 = nn.Parameter(torch.randn(4, hidden_size) * 0.1)
+        self.action_b2 = nn.Parameter(torch.zeros(4))
+
+        # Forgetting parameter and initial Q-value
+        self.f_raw = nn.Parameter(torch.tensor(-2.0))  # sigmoid -> small f
+        self.q_init = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, actions, rewards):
+        T = len(actions)
+        Q = self.q_init.expand(4).clone()
+        nll = torch.tensor(0.0)
+
+        for t in range(T):
+            # Action-history module (perseveration)
+            if t > 0:
+                a_onehot = torch.zeros(4)
+                a_onehot[actions[t - 1]] = 1.0
+                s_a = torch.tanh(F.linear(a_onehot, self.action_w1, self.action_b1))
+                c = F.linear(s_a, self.action_w2, self.action_b2)
+            else:
+                c = torch.zeros(4)
+
+            # Combine and compute log probabilities
+            h = Q + c
+            log_probs = F.log_softmax(h, dim=0)
+            nll = nll - log_probs[actions[t]]
+
+            # Reward module: update Q for chosen action
+            inp = torch.stack([Q[actions[t]], rewards[t]])
+            s_r = torch.tanh(F.linear(inp, self.reward_w1, self.reward_b1))
+            new_q = F.linear(s_r, self.reward_w2, self.reward_b2).squeeze()
+
+            Q = Q.clone()
+            Q[actions[t]] = new_q
+
+            # Forgetting: decay all Q-values toward q_init
+            f = torch.sigmoid(self.f_raw)
+            Q = (1 - f) * Q + f * self.q_init
+
+        return nll
+
+
+def fit_participant_rlann(actions, rewards, n_steps=1000, lr=1e-3, weight_decay=1e-4):
+    """Fit RL-ANN model to one participant's data."""
+    model = RLANN(hidden_size=32)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    actions_t = torch.tensor(actions, dtype=torch.long)
+    rewards_t = torch.tensor(rewards, dtype=torch.float32)
+
+    loss_history = []
+    for step in range(n_steps):
+        optimizer.zero_grad()
+        loss = model(actions_t, rewards_t)
+        loss.backward()
+        optimizer.step()
+        loss_history.append(loss.item())
+
+    return loss_history
+
+
+def section_4(selected_pids):
+    print("=" * 70)
+    print("SECTION 4: RL-ANN Model & Comparison")
+    print("=" * 70)
+
+    df = pd.read_csv(DATA_PATH)
+
+    # Use same 5 example participants as section 3
+    example_pids = selected_pids[:5]
+
+    ql_losses = {}
+    ann_losses = {}
+
+    for i, pid in enumerate(example_pids):
+        sub = df[df["s_id"] == pid]
+        block_counts = sub.groupby("block").size()
+        block_id = block_counts[block_counts == 150].index[0]
+        block_data = sub[sub["block"] == block_id].sort_values("trial_id")
+
+        actions = block_data["action"].values.astype(int)
+        rewards = block_data["reward"].values.astype(float)
+
+        print(f"  Fitting participant {pid} ({i + 1}/5)...")
+
+        # Fit Q-learning (refit for fair comparison with same n_steps)
+        ql_loss, _ = fit_participant_ql(actions, rewards, n_steps=1000, lr=0.01)
+        ql_losses[pid] = ql_loss
+
+        # Fit RL-ANN
+        ann_loss = fit_participant_rlann(actions, rewards, n_steps=1000, lr=1e-3)
+        ann_losses[pid] = ann_loss
+
+    # Plot comparison
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4), sharey=True)
+    for idx, pid in enumerate(example_pids):
+        ax = axes[idx]
+        ax.plot(ql_losses[pid], label="Q-Learning", alpha=0.8, color="#377eb8")
+        ax.plot(ann_losses[pid], label="RL-ANN", alpha=0.8, color="#e41a1c")
+        ax.set_xlabel("Step")
+        ax.set_title(f"P{pid}")
+        if idx == 0:
+            ax.set_ylabel("Negative Log-Likelihood")
+            ax.legend(fontsize=8)
+
+    plt.suptitle("Loss Curves: Q-Learning vs RL-ANN", fontsize=14)
+    plt.tight_layout()
+    plt.savefig("plot_4_nn_comparison.png", dpi=150)
+    plt.close()
+    print("Saved: plot_4_nn_comparison.png")
+
+    # Compute final NLL per trial for comparison
+    print("\n  Final NLL per trial (lower is better):")
+    print(f"  {'PID':<10} {'Q-Learning':<15} {'RL-ANN':<15} {'RL-ANN better?'}")
+    for pid in example_pids:
+        ql_final = ql_losses[pid][-1] / 150
+        ann_final = ann_losses[pid][-1] / 150
+        better = "Yes" if ann_final < ql_final else "No"
+        print(f"  P{pid:<9} {ql_final:<15.4f} {ann_final:<15.4f} {better}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    print("\n" + "=" * 70)
+    print("RL PIPELINE REPORT")
+    print("Based on Eckstein et al. (2026), Nature Human Behaviour")
+    print("=" * 70 + "\n")
+
+    section_1()
+    section_2()
+    params_df, all_losses_ql, selected_pids = section_3()
+    section_4(selected_pids)
+
+    print("=" * 70)
+    print("REPORT COMPLETE. Generated plots:")
+    print("  1. plot_1_data_exploration.png")
+    print("  2. plot_2_model_rewards.png")
+    print("  3. plot_3a_loss_curves.png")
+    print("  4. plot_3b_parameter_scatter.png")
+    print("  5. plot_4_nn_comparison.png")
+    print("=" * 70)
